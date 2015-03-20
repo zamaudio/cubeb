@@ -21,6 +21,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <cmath>
+#include <algorithm>
+#include <vector>
 
 /**Taken from winbase.h, Not in MinGW.*/
 #ifndef STACK_SIZE_PARAM_IS_A_RESERVATION
@@ -181,6 +183,8 @@ int setup_wasapi_stream(cubeb_stream * stm);
 
 }
 
+class wasapi_endpoint_notification_client;
+
 struct cubeb
 {
   cubeb_ops const * ops;
@@ -189,9 +193,14 @@ struct cubeb
   HMODULE mmcss_module;
   set_mm_thread_characteristics_function set_mm_thread_characteristics;
   revert_mm_thread_characteristics_function revert_mm_thread_characteristics;
+  /* Device enumerator to be able to be notified when the default
+     device change. */
+  IMMDeviceEnumerator * device_enumerator;
+  /* Device notification client, to be able to be notified when the default
+     audio device changes and route the audio to the new default audio output
+     device */
+  wasapi_endpoint_notification_client * notification_client;
 };
-
-class wasapi_endpoint_notification_client;
 
 struct cubeb_stream
 {
@@ -219,19 +228,9 @@ struct cubeb_stream
   IAudioRenderClient * render_client;
   /* Interface pointer to use the volume facilities. */
   IAudioStreamVolume * audio_stream_volume;
-  /* Device enumerator to be able to be notified when the default
-     device change. */
-  IMMDeviceEnumerator * device_enumerator;
-  /* Device notification client, to be able to be notified when the default
-     audio device changes and route the audio to the new default audio output
-     device */
-  wasapi_endpoint_notification_client * notification_client;
   /* This event is set by the stream_stop and stream_destroy
      function, so the render loop can exit properly. */
   HANDLE shutdown_event;
-  /* Set by OnDefaultDeviceChanged when a stream reconfiguration is required.
-     The reconfiguration is handled by the render loop thread. */
-  HANDLE reconfigure_event;
   /* This is set by WASAPI when we should refill the stream. */
   HANDLE refill_event;
   /* Each cubeb_stream has its own thread. */
@@ -287,10 +286,15 @@ public:
     return S_OK;
   }
 
-  wasapi_endpoint_notification_client(HANDLE event)
+  wasapi_endpoint_notification_client()
     : ref_count(1)
-    , reconfigure_event(event)
+    , lock(new owned_critical_section)
   { }
+
+  ~wasapi_endpoint_notification_client()
+  {
+    delete lock;
+  }
 
   HRESULT STDMETHODCALLTYPE
   OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR device_id)
@@ -302,9 +306,12 @@ public:
       return S_OK;
     }
 
-    BOOL ok = SetEvent(reconfigure_event);
-    if (!ok) {
-      LOG("SetEvent on reconfigure_event failed: %x", GetLastError());
+    auto_lock l(lock);
+    for (std::vector<HANDLE>::size_type i = 0; i < clients.size(); ++i) {
+      BOOL ok = SetEvent(clients[i]);
+      if (!ok) {
+        LOG("SetEvent(%d) on client reconfigure event failed: %x", i, GetLastError());
+      }
     }
 
     return S_OK;
@@ -337,10 +344,29 @@ public:
     LOG("Audio device property value changed.\n");
     return S_OK;
   }
+
+  HANDLE add_client()
+  {
+    HANDLE h = CreateEvent(NULL, 0, 0, NULL);
+    if (!h) {
+      LOG("Can't create a client event, error: %x\n", GetLastError());
+      return INVALID_HANDLE_VALUE;
+    }
+    auto_lock l(lock);
+    clients.push_back(h);
+    return h;
+  }
+
+  void remove_client(HANDLE h)
+  {
+    auto_lock l(lock);
+    clients.erase(std::remove(clients.begin(), clients.end(), h), clients.end());
+  }
 private:
   /* refcount for this instance, necessary to implement MSCOM semantics. */
   LONG ref_count;
-  HANDLE reconfigure_event;
+  std::vector<HANDLE> clients;
+  owned_critical_section * lock;
 };
 
 namespace {
@@ -477,7 +503,7 @@ wasapi_stream_render_loop(LPVOID stream)
   cubeb_stream * stm = static_cast<cubeb_stream *>(stream);
 
   bool is_playing = true;
-  HANDLE wait_array[3] = {stm->shutdown_event, stm->reconfigure_event, stm->refill_event};
+  HANDLE wait_array[3] = {stm->shutdown_event, INVALID_HANDLE_VALUE, stm->refill_event};
   HANDLE mmcss_handle = NULL;
   HRESULT hr = 0;
   bool first = true;
@@ -498,6 +524,7 @@ wasapi_stream_render_loop(LPVOID stream)
     LOG("Unable to use mmcss to bump the render thread priority: %x\n", GetLastError());
   }
 
+  wait_array[1] = stm->context->notification_client->add_client();
 
   while (is_playing) {
     DWORD waitResult = WaitForMultipleObjects(ARRAY_LENGTH(wait_array),
@@ -591,6 +618,8 @@ wasapi_stream_render_loop(LPVOID stream)
     stm->state_callback(stm, stm->user_ptr, CUBEB_STATE_ERROR);
   }
 
+  stm->context->notification_client->remove_client(wait_array[1]);
+
   stm->context->revert_mm_thread_characteristics(mmcss_handle);
 
   return 0;
@@ -608,19 +637,19 @@ BOOL WINAPI revert_mm_thread_characteristics_noop(HANDLE mmcss_handle)
   return true;
 }
 
-HRESULT register_notification_client(cubeb_stream * stm)
+HRESULT register_notification_client(cubeb * ctx)
 {
   HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator),
                                 NULL, CLSCTX_INPROC_SERVER,
-                                IID_PPV_ARGS(&stm->device_enumerator));
+                                IID_PPV_ARGS(&ctx->device_enumerator));
   if (FAILED(hr)) {
     LOG("Could not get device enumerator: %x\n", hr);
     return hr;
   }
 
-  stm->notification_client = new wasapi_endpoint_notification_client(stm->reconfigure_event);
+  ctx->notification_client = new wasapi_endpoint_notification_client();
 
-  hr = stm->device_enumerator->RegisterEndpointNotificationCallback(stm->notification_client);
+  hr = ctx->device_enumerator->RegisterEndpointNotificationCallback(ctx->notification_client);
   if (FAILED(hr)) {
     LOG("Could not register endpoint notification callback: %x\n", hr);
     return hr;
@@ -629,18 +658,18 @@ HRESULT register_notification_client(cubeb_stream * stm)
   return hr;
 }
 
-HRESULT unregister_notification_client(cubeb_stream * stm)
+HRESULT unregister_notification_client(cubeb * ctx)
 {
-  XASSERT(stm);
+  XASSERT(ctx);
 
-  if (!stm->device_enumerator) {
+  if (!ctx->device_enumerator) {
     return S_OK;
   }
 
-  stm->device_enumerator->UnregisterEndpointNotificationCallback(stm->notification_client);
+  ctx->device_enumerator->UnregisterEndpointNotificationCallback(ctx->notification_client);
 
-  SafeRelease(stm->notification_client);
-  SafeRelease(stm->device_enumerator);
+  SafeRelease(ctx->notification_client);
+  SafeRelease(ctx->device_enumerator);
 
   return S_OK;
 }
@@ -717,6 +746,13 @@ int wasapi_init(cubeb ** context, char const * context_name)
     ctx->revert_mm_thread_characteristics = &revert_mm_thread_characteristics_noop;
   }
 
+  hr = register_notification_client(ctx);
+  if (FAILED(hr)) {
+    /* this is not fatal, we can still play audio, but we won't be able
+     * to keep using the default audio endpoint if it changes. */
+    LOG("failed to register notification client, %x\n", hr);
+  }
+
   *context = ctx;
 
   return CUBEB_OK;
@@ -749,6 +785,8 @@ void stop_and_join_render_thread(cubeb_stream * stm)
 
 void wasapi_destroy(cubeb * context)
 {
+  unregister_notification_client(context);
+
   if (context->mmcss_module) {
     FreeLibrary(context->mmcss_module);
   }
@@ -1074,7 +1112,6 @@ wasapi_stream_init(cubeb * context, cubeb_stream ** stream,
                    unsigned int latency, cubeb_data_callback data_callback,
                    cubeb_state_callback state_callback, void * user_ptr)
 {
-  HRESULT hr;
   int rv;
   auto_com com;
   if (!com.ok()) {
@@ -1101,17 +1138,8 @@ wasapi_stream_init(cubeb * context, cubeb_stream ** stream,
   stm->client = NULL;
   stm->render_client = NULL;
   stm->audio_stream_volume = NULL;
-  stm->device_enumerator = NULL;
-  stm->notification_client = NULL;
 
-  stm->stream_reset_lock = new owned_critical_section();
-
-  stm->reconfigure_event = CreateEvent(NULL, 0, 0, NULL);
-  if (!stm->reconfigure_event) {
-    LOG("Can't create the reconfigure event, error: %x\n", GetLastError());
-    wasapi_stream_destroy(stm);
-    return CUBEB_ERROR;
-  }
+  stm->stream_reset_lock = new owned_critical_section;
 
   stm->refill_event = CreateEvent(NULL, 0, 0, NULL);
   if (!stm->refill_event) {
@@ -1130,13 +1158,6 @@ wasapi_stream_init(cubeb * context, cubeb_stream ** stream,
   if (rv != CUBEB_OK) {
     wasapi_stream_destroy(stm);
     return rv;
-  }
-
-  hr = register_notification_client(stm);
-  if (FAILED(hr)) {
-    /* this is not fatal, we can still play audio, but we won't be able
-     * to keep using the default audio endpoint if it changes. */
-    LOG("failed to register notification client, %x\n", hr);
   }
 
   *stream = stm;
@@ -1169,11 +1190,8 @@ void wasapi_stream_destroy(cubeb_stream * stm)
 {
   XASSERT(stm);
 
-  unregister_notification_client(stm);
-
   stop_and_join_render_thread(stm);
 
-  SafeRelease(stm->reconfigure_event);
   SafeRelease(stm->refill_event);
 
   {
@@ -1195,11 +1213,6 @@ int wasapi_stream_start(cubeb_stream * stm)
   HRESULT hr = stm->client->Start();
   if (hr == AUDCLNT_E_DEVICE_INVALIDATED) {
     LOG("audioclient invalid device, reconfiguring\n", hr);
-
-    BOOL ok = ResetEvent(stm->reconfigure_event);
-    if (!ok) {
-      LOG("resetting reconfig event failed: %x\n", GetLastError());
-    }
 
     close_wasapi_stream(stm);
     int r = setup_wasapi_stream(stm);
