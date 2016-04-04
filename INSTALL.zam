@@ -1,0 +1,8 @@
+$ autoreconf -fi
+$ ./configure --with-jack
+$ make
+$ sudo make install
+$ cd test
+$ make
+$ ./test_audio
+
