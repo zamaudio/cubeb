@@ -221,13 +221,19 @@ cbjack_process(jack_nframes_t nframes, void *arg)
   int t_jack_xruns = ctx->jack_xruns;
   int frames_read = 0;
   int i;
-
   cubeb_stream *stm = &ctx->stream;
-  float to_pre_rate = ( (float)stm->params.rate / (float)stm->context->jack_sample_rate );
-  int inputframes = nframes * to_pre_rate;
-
-  int frames_needed = inputframes;
   float *bufs[stm->params.channels];
+  int to_pre_rate;
+  int inputframes;
+  int frames_needed;
+
+  if (!stm->in_use)
+    goto end;
+
+  to_pre_rate = ( (float)stm->params.rate / (float)stm->context->jack_sample_rate );
+  inputframes = nframes * to_pre_rate;
+
+  frames_needed = inputframes;
 
   // handle xruns by reading and discarding audio that should have been played
   for (i = 0; i < t_jack_xruns; i++) {
@@ -235,8 +241,6 @@ cbjack_process(jack_nframes_t nframes, void *arg)
   }
   ctx->jack_xruns -= t_jack_xruns;
 
-  if (!stm->in_use)
-    goto end;
   if (!stm->ports_ready)
     goto end;
 
@@ -279,7 +283,7 @@ cbjack_deinterleave_audio(cubeb_stream * stream, float **bufs, int inputframes, 
                                                    &resampler_input_frames,
                                                    stream->context->resampled_interleaved_buffer_s16ne,
                                                    resampler_output_frames);
-    
+
     s16ne_to_float(stream->context->resampled_interleaved_buffer_float, stream->context->resampled_interleaved_buffer_s16ne, resampler_output_frames * stream->params.channels);
   } else if (stream->params.format == CUBEB_SAMPLE_FLOAT32NE) {
     resampler_outframes = cubeb_resampler_fill(stream->resampler,
@@ -290,7 +294,6 @@ cbjack_deinterleave_audio(cubeb_stream * stream, float **bufs, int inputframes, 
   }
     assert(resampler_outframes >= 0);
     interleaved_buffer = stream->context->resampled_interleaved_buffer_float;
-    //printf("resampler_outframes=%d\n", resampler_outframes);
     nframes = resampler_outframes;
 
   // convert interleaved buffers to contiguous buffers
@@ -346,7 +349,6 @@ jack_init (cubeb ** context, char const * context_name)
     return CUBEB_ERROR;
   }
 
-  ctx->jack_sample_rate = jack_get_sample_rate(ctx->jack_client);
   ctx->jack_xruns = 0;
 
   jack_set_process_callback (ctx->jack_client, cbjack_process, ctx);
@@ -357,6 +359,8 @@ jack_init (cubeb ** context, char const * context_name)
     cbjack_destroy(ctx);
     return CUBEB_ERROR;
   }
+
+  ctx->jack_sample_rate = jack_get_sample_rate(ctx->jack_client);
 
   ctx->active = true;
   *context = ctx;
