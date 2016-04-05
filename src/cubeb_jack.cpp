@@ -13,7 +13,6 @@
 #include <dlfcn.h>
 #include <limits>
 #include <stdio.h>
-#include <pthread.h>
 #include <sys/time.h>
 #include <assert.h>
 #include <string.h>
@@ -23,8 +22,7 @@
 #include <stdlib.h>
 #include "cubeb/cubeb.h"
 #include "cubeb-internal.h"
-
-#include "cubeb-speex-resampler.h"
+#include "cubeb_resampler.h"
 
 #include <jack/jack.h>
 #include <jack/statistics.h>
@@ -38,7 +36,7 @@ static void
 s16ne_to_float(float *dst, const int16_t *src, size_t n)
 {
   for (size_t i = 0; i < n; i++)
-    *(dst++) = *(src++) / 32767.0f;
+    *(dst++) = (float)((float)*(src++) / 32767.0f);
 }
 
 typedef enum {
@@ -119,8 +117,9 @@ struct cubeb_stream {
   cubeb_state_callback state_callback;
   void *user_ptr;
   cubeb_stream_params params;
+  cubeb_stream_params out_params;
 
-  SpeexResamplerState *resampler;
+  cubeb_resampler *resampler;
 
   play_state state;
   uint64_t position;
@@ -133,9 +132,6 @@ struct cubeb {
   struct cubeb_ops const * ops;
   void *libjack;
 
-  /**< Mutex for stream array */
-  pthread_mutex_t mutex;
-
   /**< Raw input buffer, as filled by data_callback */
   char input_buffer[FIFO_SIZE * MAX_CHANNELS];
 
@@ -143,7 +139,8 @@ struct cubeb {
   float float_interleaved_buffer[FIFO_SIZE * MAX_CHANNELS];
 
   /**< Audio buffer, at the sampling rate of the output */
-  float resampled_interleaved_buffer[FIFO_SIZE * MAX_CHANNELS * 3];
+  float resampled_interleaved_buffer_float[FIFO_SIZE * MAX_CHANNELS * 3];
+  int16_t resampled_interleaved_buffer_s16ne[FIFO_SIZE * MAX_CHANNELS * 3];
 
   /**< Non-interleaved audio buffer, used to push to the fifo */
   float buffer[MAX_CHANNELS][FIFO_SIZE];
@@ -247,14 +244,6 @@ cbjack_process(jack_nframes_t nframes, void *arg)
   for (i = 0; i < stm->params.channels; i++)
       bufs[i] = (float*)jack_port_get_buffer(stm->output_ports[i], nframes);
 
-  frames_read = cbjack_get_audio_data(stm, frames_needed, false);
-
-  if (frames_needed > frames_read) {
-      //play silence on buffer underrun
-      memset(stm->context->input_buffer + (frames_read * ctx->output_bytes_per_frame), 0,
-             (frames_needed - frames_read) * ctx->output_bytes_per_frame);
-  }
-
   cbjack_deinterleave_audio(stm, bufs, inputframes, nframes);
 
 end:
@@ -268,7 +257,7 @@ cbjack_get_audio_data(cubeb_stream *stream, unsigned int max_num_frames, bool di
                                                   stream->user_ptr,
                                                   NULL,
                                                   stream->context->input_buffer,
-                                                  max_num_frames);
+                                                  max_num_frames * stream->context->output_bytes_per_frame);
   return discard ? 0 : num_frames;
 }
 
@@ -277,27 +266,32 @@ cbjack_deinterleave_audio(cubeb_stream * stream, float **bufs, int inputframes, 
 {
   float *interleaved_buffer;
 
-  // convert 16-bit to float if needed
+  float *input_float = (float *)stream->context->input_buffer;
+  int16_t *input_s16ne = (int16_t *)stream->context->input_buffer;
+
+    long resampler_input_frames = inputframes;
+    long resampler_output_frames = nframes;
+    long resampler_outframes = 0;
+
   if (stream->params.format == CUBEB_SAMPLE_S16NE) {
-    s16ne_to_float(stream->context->float_interleaved_buffer, (short*)stream->context->input_buffer, inputframes * stream->params.channels);
-    interleaved_buffer = stream->context->float_interleaved_buffer;
+    resampler_outframes = cubeb_resampler_fill(stream->resampler,
+                                                   input_s16ne,
+                                                   &resampler_input_frames,
+                                                   stream->context->resampled_interleaved_buffer_s16ne,
+                                                   resampler_output_frames);
+    
+    s16ne_to_float(stream->context->resampled_interleaved_buffer_float, stream->context->resampled_interleaved_buffer_s16ne, resampler_output_frames * stream->params.channels);
   } else if (stream->params.format == CUBEB_SAMPLE_FLOAT32NE) {
-    interleaved_buffer = (float *)stream->context->input_buffer;
+    resampler_outframes = cubeb_resampler_fill(stream->resampler,
+                                                   input_float,
+                                                   &resampler_input_frames,
+                                                   stream->context->resampled_interleaved_buffer_float,
+                                                   resampler_output_frames);
   }
-
-  if (stream->resampler != NULL) {
-    uint32_t resampler_consumed_frames = inputframes;
-    uint32_t resampler_output_frames = (FIFO_SIZE / sizeof(float)) * MAX_CHANNELS * 3;
-
-    int resampler_error = speex_resampler_process_interleaved_float(stream->resampler,
-                                                                    interleaved_buffer,
-                                                                    &resampler_consumed_frames,
-                                                                    stream->context->resampled_interleaved_buffer,
-                                                                    &resampler_output_frames);
-    assert(resampler_error == 0);
-    interleaved_buffer = stream->context->resampled_interleaved_buffer;
-    nframes = resampler_output_frames;
-  }
+    assert(resampler_outframes >= 0);
+    interleaved_buffer = stream->context->resampled_interleaved_buffer_float;
+    //printf("resampler_outframes=%d\n", resampler_outframes);
+    nframes = resampler_outframes;
 
   // convert interleaved buffers to contiguous buffers
   for (unsigned int c = 0; c < stream->params.channels; c++) {
@@ -332,12 +326,6 @@ jack_init (cubeb ** context, char const * context_name)
   }
 
   r = load_jack_lib(ctx);
-  if (r != 0) {
-    cbjack_destroy(ctx);
-    return CUBEB_ERROR;
-  }
-
-  r = pthread_mutex_init(&ctx->mutex, NULL);
   if (r != 0) {
     cbjack_destroy(ctx);
     return CUBEB_ERROR;
@@ -411,7 +399,6 @@ cbjack_destroy(cubeb * context)
   if (context->jack_client)
     jack_client_close (context->jack_client);
 
-  pthread_mutex_destroy(&context->mutex);
   free(context);
 }
 
@@ -478,18 +465,21 @@ cbjack_stream_init(cubeb * context, cubeb_stream ** stream, char const * stream_
   context->jack_buffer_size = jack_get_buffer_size(context->jack_client);
   context->fragment_size = context->jack_buffer_size * context->output_bytes_per_frame;
 
-  if (stm->params.rate != stm->context->jack_sample_rate) {
-    int resampler_error;
-    stm->resampler = speex_resampler_init(stm->params.channels,
-                                          stm->params.rate,
-                                          stm->context->jack_sample_rate,
-                                          10,
-                                          &resampler_error);
-    if (resampler_error != 0) {
+  stm->resampler = NULL;
+    stm->out_params.format = CUBEB_SAMPLE_FLOAT32NE;
+    stm->out_params.rate = stm->context->jack_sample_rate;
+    stm->out_params.channels = stm->params.channels;
+    stm->resampler = cubeb_resampler_create(stm,
+                                            &stm->params,
+                                            &stm->out_params,
+                                            stm->context->jack_sample_rate,
+                                            stm->data_callback,
+                                            stm->user_ptr,
+                                            CUBEB_RESAMPLER_QUALITY_DESKTOP);
+    if (!stm->resampler) {
       stm->in_use = false;
       return CUBEB_ERROR;
     }
-  }
 
   for (unsigned int c = 0; c < stm->params.channels; c++) {
     char portname[256];
@@ -523,8 +513,8 @@ cbjack_stream_destroy(cubeb_stream * stream)
     stream->output_ports[c] = NULL;
   }
 
-  if (stream->resampler != NULL) {
-    speex_resampler_destroy(stream->resampler);
+  if (stream->resampler) {
+    cubeb_resampler_destroy(stream->resampler);
     stream->resampler = NULL;
   }
   stream->in_use = false;
