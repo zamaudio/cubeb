@@ -224,16 +224,27 @@ cbjack_process(jack_nframes_t nframes, void *arg)
   ctx->jack_xruns -= t_jack_xruns;
 
 
-  if (!stm->ports_ready || stm->pause)
+  if (!stm->ports_ready)
     goto end;
 
   // get jack output buffers
   for (i = 0; i < (int)stm->params.channels; i++)
       bufs[i] = (float*)jack_port_get_buffer(stm->output_ports[i], nframes);
 
-  cbjack_deinterleave_audio(stm, bufs, frames_needed, nframes);
-
-  stm->position += nframes * stm->context->output_bytes_per_frame;
+  if (stm->pause) {
+    // paused, play silence
+    for (unsigned int c = 0; c < stm->params.channels; c++) {
+      float* buffer = bufs[c];
+      for (long f = 0; f < nframes; f++) {
+        buffer[f] = 0.f;
+      }
+    }
+  } else {
+    // unpaused, play audio
+    cbjack_deinterleave_audio(stm, bufs, frames_needed, nframes);
+    // advance stream position
+    stm->position += nframes * stm->context->output_bytes_per_frame;
+  }
 
 end:
   return 0;
