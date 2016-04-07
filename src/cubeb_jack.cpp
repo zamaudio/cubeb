@@ -27,7 +27,7 @@
 #include <jack/jack.h>
 #include <jack/statistics.h>
 
-//static const int MAX_STREAMS = 16;
+static const int MAX_STREAMS = 16;
 static const int MAX_CHANNELS  = 8;
 static const int FIFO_SIZE = 4096 * sizeof(float);
 static const bool AUTO_CONNECT_JACK_PORTS = true;
@@ -126,7 +126,8 @@ struct cubeb {
   /**< Non-interleaved audio buffer, used to push to the fifo */
   float buffer[MAX_CHANNELS][FIFO_SIZE];
 
-  cubeb_stream stream;
+  cubeb_stream streams[MAX_STREAMS];
+  unsigned int active_streams;
 
   bool active;
   unsigned int jack_sample_rate;
@@ -173,25 +174,26 @@ cbjack_graph_order_callback(void *arg)
 {
   cubeb *ctx = (cubeb *)arg;
   int i;
-  cubeb_stream *stm = &ctx->stream;
 
   jack_latency_range_t latency_range;
   jack_nframes_t port_latency, max_latency = 0;
 
-  if (!stm->in_use)
-    goto end;
-  if (!stm->ports_ready)
-    goto end;
+  for (int j = 0; j < MAX_STREAMS; j++) {
+    cubeb_stream *stm = &ctx->streams[j];
 
-  for (i = 0; i < (int)stm->params.channels; ++i) {
+    if (!stm->in_use)
+      continue;
+    if (!stm->ports_ready)
+      continue;
+
+    for (i = 0; i < (int)stm->params.channels; ++i) {
       jack_port_get_latency_range(stm->output_ports[i], JackPlaybackLatency, &latency_range);
       port_latency = latency_range.max;
       if (port_latency > max_latency)
           max_latency = port_latency;
+    }
+    ctx->jack_latency = max_latency;
   }
-  ctx->jack_latency = max_latency;
-
-end:
   return 0;
 }
 
@@ -202,49 +204,51 @@ cbjack_process(jack_nframes_t nframes, void *arg)
   int t_jack_xruns = ctx->jack_xruns;
   int frames_read = 0;
   int i;
-  cubeb_stream *stm = &ctx->stream;
-  float *bufs[stm->params.channels];
   int to_pre_rate;
   int inputframes;
   int frames_needed;
 
-  if (!stm->in_use)
-    goto end;
+  for (int j = 0; j < MAX_STREAMS; j++) {
+    cubeb_stream *stm = &ctx->streams[j];
+    float *bufs[stm->params.channels];
 
-  to_pre_rate = 1.f / ( (float)stm->params.rate / (float)stm->context->jack_sample_rate );
-  inputframes = nframes * to_pre_rate;
+    if (!stm->in_use)
+      continue;
 
-  frames_needed = inputframes;
+    to_pre_rate = 1.f / ( (float)stm->params.rate / (float)ctx->jack_sample_rate );
+    inputframes = nframes * to_pre_rate;
 
-  // handle xruns by reading and discarding audio that should have been played
-  for (i = 0; i < t_jack_xruns; i++) {
-      frames_read = cbjack_get_audio_data(stm, ctx->jack_buffer_size * to_pre_rate, true);
-      stm->position += frames_read * stm->context->output_bytes_per_frame;
-  }
-  ctx->jack_xruns -= t_jack_xruns;
+    frames_needed = inputframes;
+
+    // handle xruns by reading and discarding audio that should have been played
+    for (i = 0; i < t_jack_xruns; i++) {
+        frames_read = cbjack_get_audio_data(stm, ctx->jack_buffer_size * to_pre_rate, true);
+        stm->position += frames_read * ctx->output_bytes_per_frame;
+    }
+    ctx->jack_xruns -= t_jack_xruns;
 
 
-  if (!stm->ports_ready)
-    goto end;
+    if (!stm->ports_ready)
+      continue;
 
-  // get jack output buffers
-  for (i = 0; i < (int)stm->params.channels; i++)
+    // get jack output buffers
+    for (i = 0; i < (int)stm->params.channels; i++)
       bufs[i] = (float*)jack_port_get_buffer(stm->output_ports[i], nframes);
 
-  if (stm->pause) {
-    // paused, play silence
-    for (unsigned int c = 0; c < stm->params.channels; c++) {
-      float* buffer = bufs[c];
-      for (long f = 0; f < nframes; f++) {
-        buffer[f] = 0.f;
+    if (stm->pause) {
+      // paused, play silence
+      for (unsigned int c = 0; c < stm->params.channels; c++) {
+        float* buffer = bufs[c];
+        for (long f = 0; f < nframes; f++) {
+          buffer[f] = 0.f;
+        }
       }
+    } else {
+      // unpaused, play audio
+      cbjack_deinterleave_audio(stm, bufs, frames_needed, nframes);
     }
-  } else {
-    // unpaused, play audio
-    cbjack_deinterleave_audio(stm, bufs, frames_needed, nframes);
   }
 
-end:
   return 0;
 }
 
@@ -396,12 +400,14 @@ cbjack_destroy(cubeb * context)
 static cubeb_stream*
 context_alloc_stream(cubeb * context, char const * stream_name)
 {
-    if (!context->stream.in_use) {
-      cubeb_stream * stm = &context->stream;
+  for (int i = 0; i < MAX_STREAMS; i++) {
+    if (!context->streams[i].in_use) {
+      cubeb_stream * stm = &context->streams[i];
       stm->in_use = true;
-      snprintf(stm->stream_name, 255, "%s", stream_name);
+      snprintf(stm->stream_name, 255, "%s_%u", stream_name, i);
       return stm;
     }
+  }
   return NULL;
 }
 
@@ -441,6 +447,7 @@ cbjack_stream_init(cubeb * context, cubeb_stream ** stream, char const * stream_
     return CUBEB_ERROR;
   }
 
+  stm->ports_ready = false;
   stm->user_ptr = user_ptr;
   stm->context = context;
   stm->params = *output_stream_params;
