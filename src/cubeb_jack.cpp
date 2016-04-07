@@ -242,8 +242,6 @@ cbjack_process(jack_nframes_t nframes, void *arg)
   } else {
     // unpaused, play audio
     cbjack_deinterleave_audio(stm, bufs, frames_needed, nframes);
-    // advance stream position
-    stm->position += nframes * stm->context->output_bytes_per_frame;
   }
 
 end:
@@ -288,17 +286,20 @@ cbjack_deinterleave_audio(cubeb_stream * stream, float **bufs, int inputframes, 
                                                    stream->context->resampled_interleaved_buffer_float,
                                                    resampler_output_frames);
   }
-    assert(resampler_outframes >= 0);
-    interleaved_buffer = stream->context->resampled_interleaved_buffer_float;
-    nframes = resampler_outframes;
+  interleaved_buffer = stream->context->resampled_interleaved_buffer_float;
 
   // convert interleaved buffers to contiguous buffers
   for (unsigned int c = 0; c < stream->params.channels; c++) {
     float* buffer = bufs[c];
-    for (long f = 0; f < nframes; f++) {
+    for (long f = 0; f < resampler_outframes; f++) {
       buffer[f] = interleaved_buffer[(f * stream->params.channels) + c] * stream->volume;
     }
+    for (long f = resampler_outframes; f < nframes; f++) {
+      buffer[f] = 0.f;
+    }
   }
+  // advance stream position
+  stream->position += resampler_outframes * stream->context->output_bytes_per_frame;
 }
 
 /*static*/ int
@@ -395,13 +396,13 @@ cbjack_destroy(cubeb * context)
 static cubeb_stream*
 context_alloc_stream(cubeb * context, char const * stream_name)
 {
-  //  if (!context->stream.in_use) {
+    if (!context->stream.in_use) {
       cubeb_stream * stm = &context->stream;
       stm->in_use = true;
       snprintf(stm->stream_name, 255, "%s", stream_name);
       return stm;
-  //  }
-  //return NULL;
+    }
+  return NULL;
 }
 
 static int
