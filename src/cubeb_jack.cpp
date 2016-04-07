@@ -364,7 +364,11 @@ cbjack_get_min_latency(cubeb * ctx, cubeb_stream_params params, uint32_t * laten
 static int
 cbjack_get_preferred_sample_rate(cubeb * ctx, uint32_t * rate)
 {
-  *rate = jack_get_sample_rate(ctx->jack_client);
+  if (ctx->jack_client) {
+    *rate = ctx->jack_sample_rate;
+  } else {
+    *rate = 48000;
+  }
   return CUBEB_OK;
 }
 
