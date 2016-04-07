@@ -406,6 +406,7 @@ cbjack_stream_init(cubeb * context, cubeb_stream ** stream, char const * stream_
                    cubeb_state_callback state_callback,
                    void * user_ptr)
 {
+  int stream_actual_rate;
   assert(!input_stream_params && "not supported.");
   if (input_device || output_device) {
     /* Device selection not yet implemented. */
@@ -435,6 +436,10 @@ cbjack_stream_init(cubeb * context, cubeb_stream ** stream, char const * stream_
   stm->user_ptr = user_ptr;
   stm->context = context;
   stm->params = *output_stream_params;
+
+  stream_actual_rate = stm->params.rate;
+  stm->params.rate = context->jack_sample_rate;
+
   stm->data_callback = data_callback;
   stm->state_callback = state_callback;
   stm->position = 0;
@@ -452,7 +457,7 @@ cbjack_stream_init(cubeb * context, cubeb_stream ** stream, char const * stream_
   stm->resampler = cubeb_resampler_create(stm,
                                           nullptr,
                                           &stm->params,
-                                          stm->params.rate,
+                                          stream_actual_rate,
                                           stm->data_callback,
                                           stm->user_ptr,
                                           CUBEB_RESAMPLER_QUALITY_DESKTOP);
@@ -505,7 +510,6 @@ cbjack_stream_destroy(cubeb_stream * stream)
 static int
 cbjack_stream_start(cubeb_stream * stream)
 {
-  stream->volume = 1.f;
   stream->pause = false;
   stream->state_callback(stream, stream->user_ptr, CUBEB_STATE_STARTED);
   return CUBEB_OK;
@@ -514,7 +518,6 @@ cbjack_stream_start(cubeb_stream * stream)
 static int
 cbjack_stream_stop(cubeb_stream * stream)
 {
-  stream->volume = 0.f;
   stream->pause = true;
   stream->state_callback(stream, stream->user_ptr, CUBEB_STATE_STOPPED);
   return CUBEB_OK;
