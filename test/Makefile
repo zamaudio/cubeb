@@ -1,2 +1,2 @@
 all:
-	g++ test_audio.cpp -o test_audio -lcubeb -ljack -g
+	g++ test_audio.cpp -o test_audio -lcubeb -g
