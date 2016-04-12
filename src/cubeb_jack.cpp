@@ -347,10 +347,6 @@ jack_init (cubeb ** context, char const * context_name)
 {
   int r;
 
-  if (context == NULL) {
-    return CUBEB_ERROR_INVALID_PARAMETER;
-  }
-
   *context = NULL;
 
   cubeb *ctx = (cubeb*)calloc(1, sizeof(*ctx));
@@ -480,15 +476,6 @@ cbjack_stream_init(cubeb * context, cubeb_stream ** stream, char const * stream_
                    void * user_ptr)
 {
   int stream_actual_rate;
-  assert(!input_stream_params && "not supported.");
-  if (input_device || output_device) {
-    /* Device selection not yet implemented. */
-    return CUBEB_ERROR_DEVICE_UNAVAILABLE;
-  }
-
-  if (stream == NULL || output_stream_params == NULL) {
-    return CUBEB_ERROR_INVALID_PARAMETER;
-  }
 
   if (output_stream_params->format != CUBEB_SAMPLE_FLOAT32NE &&
       output_stream_params->format != CUBEB_SAMPLE_S16NE) {
@@ -511,7 +498,7 @@ cbjack_stream_init(cubeb * context, cubeb_stream ** stream, char const * stream_
   stm->params = *output_stream_params;
 
   stream_actual_rate = stm->params.rate;
-  stm->params.rate = context->jack_sample_rate;
+  cbjack_get_preferred_sample_rate(context, &(stm->params.rate));
 
   stm->data_callback = data_callback;
   stm->state_callback = state_callback;
