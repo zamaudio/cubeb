@@ -54,6 +54,13 @@ static const int MAX_CHANNELS  = 8;
 static const int FIFO_SIZE = 4096 * sizeof(float);
 static const bool AUTO_CONNECT_JACK_PORTS = true;
 
+enum devstream {
+  NONE = 0,
+  IN_ONLY,
+  OUT_ONLY,
+  DUPLEX,
+};
+
 static void
 s16ne_to_float(float *dst, const int16_t *src, size_t n)
 {
@@ -71,7 +78,9 @@ static int cbjack_get_min_latency(cubeb * ctx, cubeb_stream_params params, uint3
 static int cbjack_get_latency(cubeb_stream * stm, unsigned int * latency_ms);
 static int cbjack_get_preferred_sample_rate(cubeb * ctx, uint32_t * rate);
 static void cbjack_destroy(cubeb * context);
-static void cbjack_deinterleave_audio(cubeb_stream * stream, float **bufs, jack_nframes_t nframes);
+static void cbjack_deinterleave_audio(cubeb_stream * stream, float **bufs_in, float **bufs_out, jack_nframes_t nframes);
+static int cbjack_enumerate_devices(cubeb * context, cubeb_device_type type,
+                                    cubeb_device_collection ** collection);
 static int cbjack_stream_init(cubeb * context, cubeb_stream ** stream, char const * stream_name,
                               cubeb_devid input_device,
                               cubeb_stream_params * input_stream_params,
@@ -93,7 +102,7 @@ static struct cubeb_ops const cbjack_ops = {
   .get_max_channel_count = cbjack_get_max_channel_count,
   .get_min_latency = cbjack_get_min_latency,
   .get_preferred_sample_rate = cbjack_get_preferred_sample_rate,
-  .enumerate_devices = NULL,
+  .enumerate_devices = cbjack_enumerate_devices,
   .destroy = cbjack_destroy,
   .stream_init = cbjack_stream_init,
   .stream_destroy = cbjack_stream_destroy,
@@ -118,14 +127,17 @@ struct cubeb_stream {
   cubeb_data_callback data_callback;
   cubeb_state_callback state_callback;
   void *user_ptr;
-  cubeb_stream_params params;
+  cubeb_stream_params in_params;
+  cubeb_stream_params out_params;
 
   cubeb_resampler *resampler;
 
   uint64_t position;
   bool pause;
+  enum devstream devs;
   char stream_name[256];
   jack_port_t *output_ports[MAX_CHANNELS];
+  jack_port_t *input_ports[MAX_CHANNELS];
   float volume;
 };
 
@@ -133,18 +145,21 @@ struct cubeb {
   struct cubeb_ops const * ops;
   void *libjack;
 
-  /**< Raw buffer, as filled by data_callback */
-  char rawbuffer_out[FIFO_SIZE * MAX_CHANNELS];
-
-  /**< Audio buffer, converted to float */
-  float float_interleaved_buffer[FIFO_SIZE * MAX_CHANNELS];
+  /**< Audio buffers, converted to float */
+  float in_float_interleaved_buffer[FIFO_SIZE * MAX_CHANNELS];
+  float out_float_interleaved_buffer[FIFO_SIZE * MAX_CHANNELS];
 
   /**< Audio buffer, at the sampling rate of the output */
-  float resampled_interleaved_buffer_float[FIFO_SIZE * MAX_CHANNELS * 3];
-  int16_t resampled_interleaved_buffer_s16ne[FIFO_SIZE * MAX_CHANNELS * 3];
+  float in_resampled_interleaved_buffer_float[FIFO_SIZE * MAX_CHANNELS * 3];
+  int16_t in_resampled_interleaved_buffer_s16ne[FIFO_SIZE * MAX_CHANNELS * 3];
+  float out_resampled_interleaved_buffer_float[FIFO_SIZE * MAX_CHANNELS * 3];
+  int16_t out_resampled_interleaved_buffer_s16ne[FIFO_SIZE * MAX_CHANNELS * 3];
 
   cubeb_stream streams[MAX_STREAMS];
   unsigned int active_streams;
+
+  cubeb_device_info devinfo[2];
+  cubeb_device_collection_changed_callback collection_changed_callback;
 
   bool active;
   unsigned int jack_sample_rate;
@@ -193,19 +208,42 @@ load_jack_lib(cubeb* context)
 static void
 cbjack_connect_ports (cubeb_stream * stream)
 {
-  const char **physical_ports = api_jack_get_ports (stream->context->jack_client,
-                                                    NULL, NULL, JackPortIsInput | JackPortIsPhysical);
-  if (physical_ports == NULL) {
-    return;
+  const char **phys_in_ports = api_jack_get_ports (stream->context->jack_client,
+                                                   NULL, NULL,
+                                                   JackPortIsInput
+                                                   | JackPortIsPhysical);
+  const char **phys_out_ports = api_jack_get_ports (stream->context->jack_client,
+                                                    NULL, NULL,
+                                                    JackPortIsOutput
+                                                    | JackPortIsPhysical);
+ printf("CONNECTING PORTS: %s\n", phys_out_ports[0]);
+
+ if (*phys_in_ports == NULL) {
+    printf("NO PLAYBACK PORTS\n");
+    goto skipplayback;
   }
 
-  // Connect to all physical ports
-  for (unsigned int c = 0; c < stream->params.channels && physical_ports[c]; c++) {
+  // Connect outputs to playback
+  for (unsigned int c = 0; c < stream->out_params.channels && stream->output_ports[c]; c++) {
     const char *src_port = api_jack_port_name (stream->output_ports[c]);
 
-    api_jack_connect (stream->context->jack_client, src_port, physical_ports[c]);
+    api_jack_connect (stream->context->jack_client, src_port, phys_in_ports[c]);
   }
-  api_jack_free(physical_ports);
+
+skipplayback:
+  if (*phys_out_ports == NULL) {
+    printf("NO CAPTURE PORTS\n");
+    goto end;
+  }
+  // Connect inputs to capture
+  for (unsigned int c = 0; c < stream->in_params.channels && stream->input_ports[c]; c++) {
+    const char *src_port = api_jack_port_name (stream->input_ports[c]);
+
+    api_jack_connect (stream->context->jack_client, phys_out_ports[c], src_port);
+  }
+end:
+  api_jack_free(phys_out_ports);
+  api_jack_free(phys_in_ports);
 }
 
 static int
@@ -237,7 +275,7 @@ cbjack_graph_order_callback(void *arg)
     if (!stm->ports_ready)
       continue;
 
-    for (i = 0; i < (int)stm->params.channels; ++i) {
+    for (i = 0; i < (int)stm->out_params.channels; ++i) {
       api_jack_port_get_latency_range(stm->output_ports[i], JackPlaybackLatency, &latency_range);
       port_latency = latency_range.max;
       if (port_latency > max_latency)
@@ -257,7 +295,8 @@ cbjack_process(jack_nframes_t nframes, void *arg)
 
   for (int j = 0; j < MAX_STREAMS; j++) {
     cubeb_stream *stm = &ctx->streams[j];
-    float *bufs[stm->params.channels];
+    float *bufs_out[stm->out_params.channels];
+    float *bufs_in[stm->in_params.channels];
 
     if (!stm->in_use)
       continue;
@@ -273,20 +312,31 @@ cbjack_process(jack_nframes_t nframes, void *arg)
       continue;
 
     // get jack output buffers
-    for (i = 0; i < (int)stm->params.channels; i++)
-      bufs[i] = (float*)api_jack_port_get_buffer(stm->output_ports[i], nframes);
+    for (i = 0; i < (int)stm->out_params.channels; i++)
+      bufs_out[i] = (float*)api_jack_port_get_buffer(stm->output_ports[i], nframes);
+
+    // get jack input buffers
+    for (i = 0; i < (int)stm->in_params.channels; i++)
+      bufs_in[i] = (float*)api_jack_port_get_buffer(stm->input_ports[i], nframes);
 
     if (stm->pause) {
-      // paused, play silence
-      for (unsigned int c = 0; c < stm->params.channels; c++) {
-        float* buffer = bufs[c];
+      // paused, play silence on output
+      for (unsigned int c = 0; c < stm->out_params.channels; c++) {
+        float* buffer_out = bufs_out[c];
         for (long f = 0; f < nframes; f++) {
-          buffer[f] = 0.f;
+          buffer_out[f] = 0.f;
+        }
+      }
+      // paused, capture silence
+      for (unsigned int c = 0; c < stm->in_params.channels; c++) {
+        float* buffer_in = bufs_in[c];
+        for (long f = 0; f < nframes; f++) {
+          buffer_in[f] = 0.f;
         }
       }
     } else {
       // unpaused, play audio
-      cbjack_deinterleave_audio(stm, bufs, nframes);
+      cbjack_deinterleave_audio(stm, bufs_in, bufs_out, nframes);
     }
   }
 
@@ -294,35 +344,79 @@ cbjack_process(jack_nframes_t nframes, void *arg)
 }
 
 static void
-cbjack_deinterleave_audio(cubeb_stream * stream, float **bufs, jack_nframes_t nframes)
+cbjack_deinterleave_audio(cubeb_stream * stream, float **bufs_in, float **bufs_out, jack_nframes_t nframes)
 {
-  float *interleaved_buffer;
+  float *in_interleaved_buffer;
+  float *out_interleaved_buffer;
 
-    long resampler_needed_frames = nframes;
-    long resampler_done_frames = 0;
+  long resampler_needed_frames = nframes;
+  long resampler_done_frames = 0;
+  long input_frames_count = nframes;
 
-  if (stream->params.format == CUBEB_SAMPLE_S16NE) {
+ if (stream->devs == DUPLEX) {
+  if (stream->out_params.format == CUBEB_SAMPLE_S16NE) {
     resampler_done_frames = cubeb_resampler_fill(stream->resampler,
-                                                   NULL,
-                                                   0,
-                                                   stream->context->resampled_interleaved_buffer_s16ne,
+                                                   stream->context->in_resampled_interleaved_buffer_s16ne,
+                                                   &input_frames_count,
+                                                   stream->context->out_resampled_interleaved_buffer_s16ne,
                                                    resampler_needed_frames);
 
-    s16ne_to_float(stream->context->resampled_interleaved_buffer_float, stream->context->resampled_interleaved_buffer_s16ne, resampler_done_frames * stream->params.channels);
-  } else if (stream->params.format == CUBEB_SAMPLE_FLOAT32NE) {
+    s16ne_to_float(stream->context->out_resampled_interleaved_buffer_float, stream->context->out_resampled_interleaved_buffer_s16ne, resampler_done_frames * stream->out_params.channels);
+    s16ne_to_float(stream->context->in_resampled_interleaved_buffer_float, stream->context->in_resampled_interleaved_buffer_s16ne, input_frames_count * stream->in_params.channels);
+
+  } else if (stream->out_params.format == CUBEB_SAMPLE_FLOAT32NE) {
     resampler_done_frames = cubeb_resampler_fill(stream->resampler,
-                                                   NULL,
-                                                   0,
-                                                   stream->context->resampled_interleaved_buffer_float,
+                                                   stream->context->in_resampled_interleaved_buffer_float,
+                                                   &input_frames_count,
+                                                   stream->context->out_resampled_interleaved_buffer_float,
                                                    resampler_needed_frames);
   }
-  interleaved_buffer = stream->context->resampled_interleaved_buffer_float;
+  out_interleaved_buffer = stream->context->out_resampled_interleaved_buffer_float;
+  in_interleaved_buffer = stream->context->in_resampled_interleaved_buffer_float;
+ } else if (stream->devs == OUT_ONLY) {
+  if (stream->out_params.format == CUBEB_SAMPLE_S16NE) {
+    resampler_done_frames = cubeb_resampler_fill(stream->resampler,
+                                                   NULL,
+                                                   0,
+                                                   stream->context->out_resampled_interleaved_buffer_s16ne,
+                                                   resampler_needed_frames);
 
-  // convert interleaved buffers to contiguous buffers
-  for (unsigned int c = 0; c < stream->params.channels; c++) {
-    float* buffer = bufs[c];
+    s16ne_to_float(stream->context->out_resampled_interleaved_buffer_float, stream->context->out_resampled_interleaved_buffer_s16ne, resampler_done_frames * stream->out_params.channels);
+  } else if (stream->out_params.format == CUBEB_SAMPLE_FLOAT32NE) {
+    resampler_done_frames = cubeb_resampler_fill(stream->resampler,
+                                                   NULL,
+                                                   0,
+                                                   stream->context->out_resampled_interleaved_buffer_float,
+                                                   resampler_needed_frames);
+  }
+  out_interleaved_buffer = stream->context->out_resampled_interleaved_buffer_float;
+ } else {
+  resampler_needed_frames = 0;
+  if (stream->in_params.format == CUBEB_SAMPLE_S16NE) {
+    resampler_done_frames = cubeb_resampler_fill(stream->resampler,
+                                                   stream->context->in_resampled_interleaved_buffer_s16ne,
+                                                   &input_frames_count,
+                                                   NULL,
+                                                   resampler_needed_frames);
+
+    s16ne_to_float(stream->context->in_resampled_interleaved_buffer_float, stream->context->in_resampled_interleaved_buffer_s16ne, input_frames_count * stream->in_params.channels);
+
+  } else if (stream->in_params.format == CUBEB_SAMPLE_FLOAT32NE) {
+    resampler_done_frames = cubeb_resampler_fill(stream->resampler,
+                                                   stream->context->in_resampled_interleaved_buffer_float,
+                                                   &input_frames_count,
+                                                   NULL,
+                                                   resampler_needed_frames);
+  }
+  in_interleaved_buffer = stream->context->in_resampled_interleaved_buffer_float;
+ }
+
+ if (stream->devs == OUT_ONLY || stream->devs == DUPLEX) {
+  // convert interleaved output buffers to contiguous buffers
+  for (unsigned int c = 0; c < stream->out_params.channels; c++) {
+    float* buffer = bufs_out[c];
     for (long f = 0; f < resampler_done_frames; f++) {
-      buffer[f] = interleaved_buffer[(f * stream->params.channels) + c] * stream->volume;
+      buffer[f] = out_interleaved_buffer[(f * stream->out_params.channels) + c] * stream->volume;
     }
     if (resampler_done_frames < resampler_needed_frames) {
       // draining
@@ -338,6 +432,29 @@ cbjack_deinterleave_audio(cubeb_stream * stream, float **bufs, jack_nframes_t nf
       stream->state_callback(stream, stream->user_ptr, CUBEB_STATE_DRAINED);
     }
   }
+ }
+ if (stream->devs == IN_ONLY || stream->devs == DUPLEX) {
+  // convert interleaved input buffers to contiguous buffers
+  for (unsigned int c = 0; c < stream->in_params.channels; c++) {
+    float* buffer = bufs_in[c];
+    for (long f = 0; f < resampler_done_frames; f++) {
+      buffer[f] = in_interleaved_buffer[(f * stream->in_params.channels) + c] * stream->volume;
+    }
+    if (resampler_done_frames < input_frames_count) {
+      // draining
+      for (long f = resampler_done_frames; f < input_frames_count; f++) {
+        buffer[f] = 0.f;
+      }
+    }
+    if (resampler_done_frames == 0) {
+      // stop, but first zero out the existing buffer
+      for (long f = 0; f < input_frames_count; f++) {
+        buffer[f] = 0.f;
+      }
+      stream->state_callback(stream, stream->user_ptr, CUBEB_STATE_DRAINED);
+    }
+  }
+ }
   // advance stream position
   stream->position += resampler_done_frames * stream->context->output_bytes_per_frame;
 }
@@ -477,8 +594,17 @@ cbjack_stream_init(cubeb * context, cubeb_stream ** stream, char const * stream_
 {
   int stream_actual_rate;
 
-  if (output_stream_params->format != CUBEB_SAMPLE_FLOAT32NE &&
-      output_stream_params->format != CUBEB_SAMPLE_S16NE) {
+  if (output_stream_params
+     && (output_stream_params->format != CUBEB_SAMPLE_FLOAT32NE &&
+         output_stream_params->format != CUBEB_SAMPLE_S16NE)
+     ) {
+    return CUBEB_ERROR_INVALID_FORMAT;
+  }
+
+  if (input_stream_params
+     && (input_stream_params->format != CUBEB_SAMPLE_FLOAT32NE &&
+         input_stream_params->format != CUBEB_SAMPLE_S16NE)
+     ) {
     return CUBEB_ERROR_INVALID_FORMAT;
   }
 
@@ -495,40 +621,89 @@ cbjack_stream_init(cubeb * context, cubeb_stream ** stream, char const * stream_
   stm->ports_ready = false;
   stm->user_ptr = user_ptr;
   stm->context = context;
-  stm->params = *output_stream_params;
 
-  stream_actual_rate = stm->params.rate;
-  cbjack_get_preferred_sample_rate(context, &(stm->params.rate));
+  stm->devs = NONE;
+  if (output_stream_params) {
+    stm->out_params = *output_stream_params;
+    stream_actual_rate = stm->out_params.rate;
+    stm->out_params.rate = api_jack_get_sample_rate(context->jack_client);
+    stm->devs = OUT_ONLY;
+    if (stm->out_params.format == CUBEB_SAMPLE_FLOAT32NE) {
+      context->output_bytes_per_frame = sizeof(float);
+    } else {
+      context->output_bytes_per_frame = sizeof(short);
+    }
+  }
+  if (input_stream_params && output_stream_params) {
+    stm->in_params = *input_stream_params;
+    stm->in_params.rate = stm->out_params.rate;
+    stm->devs = DUPLEX;
+    if (stm->out_params.format == CUBEB_SAMPLE_FLOAT32NE) {
+      context->output_bytes_per_frame = sizeof(float);
+      stm->in_params.format = CUBEB_SAMPLE_FLOAT32NE;
+    } else {
+      context->output_bytes_per_frame = sizeof(short);
+      stm->in_params.format = CUBEB_SAMPLE_S16NE;
+    }
+  } else if (input_stream_params && !output_stream_params) {
+    stm->in_params = *input_stream_params;
+    stream_actual_rate = stm->in_params.rate;
+    stm->in_params.rate = api_jack_get_sample_rate(context->jack_client);
+    stm->devs = IN_ONLY;
+    if (stm->in_params.format == CUBEB_SAMPLE_FLOAT32NE) {
+      context->output_bytes_per_frame = sizeof(float);
+    } else {
+      context->output_bytes_per_frame = sizeof(short);
+    }
+  }
 
   stm->data_callback = data_callback;
   stm->state_callback = state_callback;
   stm->position = 0;
   stm->volume = 1.0f;
-  if (stm->params.format == CUBEB_SAMPLE_FLOAT32NE) {
-      context->output_bytes_per_frame = sizeof(float);
-  } else {
-      context->output_bytes_per_frame = sizeof(short);
-  }
   context->jack_buffer_size = api_jack_get_buffer_size(context->jack_client);
   context->fragment_size = context->jack_buffer_size * context->output_bytes_per_frame;
 
+  if (stm->devs == NONE) {
+    return CUBEB_ERROR;
+  }
+
   stm->resampler = NULL;
 
-  stm->resampler = cubeb_resampler_create(stm,
-                                          nullptr,
-                                          &stm->params,
+  if (stm->devs == DUPLEX) {
+    stm->resampler = cubeb_resampler_create(stm,
+                                          &stm->in_params,
+                                          &stm->out_params,
                                           stream_actual_rate,
                                           stm->data_callback,
                                           stm->user_ptr,
                                           CUBEB_RESAMPLER_QUALITY_DESKTOP);
-    if (!stm->resampler) {
-      stm->in_use = false;
-      return CUBEB_ERROR;
-    }
+  } else if (stm->devs == IN_ONLY) {
+    stm->resampler = cubeb_resampler_create(stm,
+                                          &stm->in_params,
+                                          nullptr,
+                                          stream_actual_rate,
+                                          stm->data_callback,
+                                          stm->user_ptr,
+                                          CUBEB_RESAMPLER_QUALITY_DESKTOP);
+  } else if (stm->devs == OUT_ONLY) {
+    stm->resampler = cubeb_resampler_create(stm,
+                                          nullptr,
+                                          &stm->out_params,
+                                          stream_actual_rate,
+                                          stm->data_callback,
+                                          stm->user_ptr,
+                                          CUBEB_RESAMPLER_QUALITY_DESKTOP);
+  }
 
-  for (unsigned int c = 0; c < stm->params.channels; c++) {
+  if (!stm->resampler) {
+    stm->in_use = false;
+    return CUBEB_ERROR;
+  }
+
+  for (unsigned int c = 0; c < stm->out_params.channels; c++) {
     char portname[256];
-    snprintf(portname, 255, "%s_%d", stm->stream_name, c);
+    snprintf(portname, 255, "%s_out_%d", stm->stream_name, c);
     stm->output_ports[c] = api_jack_port_register(stm->context->jack_client,
                                                   portname,
                                                   JACK_DEFAULT_AUDIO_TYPE,
@@ -536,9 +711,17 @@ cbjack_stream_init(cubeb * context, cubeb_stream ** stream, char const * stream_
                                                   0);
   }
 
-  if (AUTO_CONNECT_JACK_PORTS) {
-    cbjack_connect_ports(stm);
+  for (unsigned int c = 0; c < stm->in_params.channels; c++) {
+    char portname[256];
+    snprintf(portname, 255, "%s_in_%d", stm->stream_name, c);
+    stm->input_ports[c] = api_jack_port_register(stm->context->jack_client,
+                                                  portname,
+                                                  JACK_DEFAULT_AUDIO_TYPE,
+                                                  JackPortIsInput,
+                                                  0);
   }
+
+  cbjack_connect_ports(stm);
 
   stm->ports_ready = true;
   stm->pause = true;
@@ -553,10 +736,17 @@ cbjack_stream_destroy(cubeb_stream * stream)
 {
   stream->ports_ready = false;
 
-  for (unsigned int c = 0; c < stream->params.channels; c++) {
+  for (unsigned int c = 0; c < stream->out_params.channels; c++) {
     if (stream->output_ports[c]) {
       api_jack_port_unregister (stream->context->jack_client, stream->output_ports[c]);
       stream->output_ports[c] = NULL;
+    }
+  }
+
+  for (unsigned int c = 0; c < stream->in_params.channels; c++) {
+    if (stream->input_ports[c]) {
+      api_jack_port_unregister (stream->context->jack_client, stream->input_ports[c]);
+      stream->input_ports[c] = NULL;
     }
   }
 
@@ -594,5 +784,33 @@ static int
 cbjack_stream_set_volume(cubeb_stream * stm, float volume)
 {
   stm->volume = volume;
+  return CUBEB_OK;
+}
+
+static int
+cbjack_enumerate_devices(cubeb * context, cubeb_device_type type,
+                         cubeb_device_collection ** collection)
+{
+  context->devinfo[0].type = CUBEB_DEVICE_TYPE_OUTPUT;
+  context->devinfo[0].state = CUBEB_DEVICE_STATE_ENABLED;
+  context->devinfo[0].preferred = CUBEB_DEVICE_PREF_NONE;
+  context->devinfo[0].max_channels = MAX_CHANNELS;
+  context->devinfo[0].default_format = CUBEB_DEVICE_FMT_F32NE;
+
+  context->devinfo[1].type = CUBEB_DEVICE_TYPE_INPUT;
+  context->devinfo[1].state = CUBEB_DEVICE_STATE_ENABLED;
+  context->devinfo[1].preferred = CUBEB_DEVICE_PREF_NONE;
+  context->devinfo[1].max_channels = MAX_CHANNELS;
+  context->devinfo[1].default_format = CUBEB_DEVICE_FMT_F32NE;
+
+  *collection = (cubeb_device_collection *)
+                 malloc(sizeof(cubeb_device_collection) +
+                        2 * sizeof(cubeb_device_info *));
+
+  (*collection)->count = 2;
+
+  (*collection)->device[0] = &context->devinfo[0];
+  (*collection)->device[1] = &context->devinfo[1];
+
   return CUBEB_OK;
 }

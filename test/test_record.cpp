@@ -105,7 +105,7 @@ int main(int argc, char *argv[])
   params.rate = SAMPLE_FREQUENCY;
   params.channels = 1;
 
-  r = cubeb_stream_init(ctx, &stream, "Cubeb record (mono)", NULL, &params, NULL, nullptr,
+  r = cubeb_stream_init(ctx, &stream, "Cubeb record (mono)", NULL, &params, NULL, NULL,
                         250, data_cb, state_cb, &stream_state);
   if (r != CUBEB_OK) {
     fprintf(stderr, "Error initializing cubeb stream\n");
