@@ -346,8 +346,8 @@ cbjack_process(jack_nframes_t nframes, void *arg)
 static void
 cbjack_deinterleave_audio(cubeb_stream * stream, float **bufs_in, float **bufs_out, jack_nframes_t nframes)
 {
-  float *in_interleaved_buffer;
-  float *out_interleaved_buffer;
+  float *in_interleaved_buffer = nullptr;
+  float *out_interleaved_buffer = nullptr;
 
   long resampler_needed_frames = nframes;
   long resampler_done_frames = 0;
@@ -592,7 +592,7 @@ cbjack_stream_init(cubeb * context, cubeb_stream ** stream, char const * stream_
                    cubeb_state_callback state_callback,
                    void * user_ptr)
 {
-  int stream_actual_rate;
+  int stream_actual_rate = 0;
 
   if (output_stream_params
      && (output_stream_params->format != CUBEB_SAMPLE_FLOAT32NE &&
