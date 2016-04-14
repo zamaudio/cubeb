@@ -139,7 +139,7 @@ int main(int argc, char *argv[])
   }
 
   cubeb_stream_start(stream);
-  delay(500);
+  delay(5000);
   cubeb_stream_stop(stream);
 
   cubeb_stream_destroy(stream);

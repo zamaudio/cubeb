@@ -50,7 +50,7 @@ int main(int argc, char * argv[])
   r = cubeb_get_min_latency(ctx, params, &latency_ms);
   assert(r == CUBEB_OK || r == CUBEB_ERROR_NOT_SUPPORTED);
   if (r == CUBEB_OK) {
-    assert(latency_ms > 0 && "Invalid minimal latency.");
+    assert(latency_ms >= 0 && "Invalid minimal latency.");
     LOG("cubeb_get_min_latency ok");
   }
 

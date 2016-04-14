@@ -128,7 +128,7 @@ test_context_variables(void)
   r = cubeb_get_min_latency(ctx, params, &value);
   assert(r == CUBEB_OK || r == CUBEB_ERROR_NOT_SUPPORTED);
   if (r == CUBEB_OK) {
-    assert(value > 0);
+    assert(value >= 0);
   }
 
   r = cubeb_get_preferred_sample_rate(ctx, &value);
