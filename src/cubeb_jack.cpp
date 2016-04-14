@@ -79,6 +79,9 @@ static int cbjack_get_latency(cubeb_stream * stm, unsigned int * latency_ms);
 static int cbjack_get_preferred_sample_rate(cubeb * ctx, uint32_t * rate);
 static void cbjack_destroy(cubeb * context);
 static void cbjack_deinterleave_audio(cubeb_stream * stream, float **bufs_in, float **bufs_out, jack_nframes_t nframes);
+static int cbjack_stream_device_destroy(cubeb_stream * stream,
+                                        cubeb_device * device);
+static int cbjack_stream_get_current_device(cubeb_stream * stm, cubeb_device ** const device);
 static int cbjack_enumerate_devices(cubeb * context, cubeb_device_type type,
                                     cubeb_device_collection ** collection);
 static int cbjack_stream_init(cubeb * context, cubeb_stream ** stream, char const * stream_name,
@@ -112,8 +115,8 @@ static struct cubeb_ops const cbjack_ops = {
   .stream_get_latency = cbjack_get_latency,
   .stream_set_volume = cbjack_stream_set_volume,
   .stream_set_panning = NULL,
-  .stream_get_current_device = NULL,
-  .stream_device_destroy = NULL,
+  .stream_get_current_device = cbjack_stream_get_current_device,
+  .stream_device_destroy = cbjack_stream_device_destroy,
   .stream_register_device_changed_callback = NULL,
   .register_device_collection_changed = NULL
 };
@@ -158,7 +161,7 @@ struct cubeb {
   cubeb_stream streams[MAX_STREAMS];
   unsigned int active_streams;
 
-  cubeb_device_info devinfo[2];
+  cubeb_device_info *devinfo;
   cubeb_device_collection_changed_callback collection_changed_callback;
 
   bool active;
@@ -216,10 +219,8 @@ cbjack_connect_ports (cubeb_stream * stream)
                                                     NULL, NULL,
                                                     JackPortIsOutput
                                                     | JackPortIsPhysical);
- printf("CONNECTING PORTS: %s\n", phys_out_ports[0]);
 
  if (*phys_in_ports == NULL) {
-    printf("NO PLAYBACK PORTS\n");
     goto skipplayback;
   }
 
@@ -232,7 +233,6 @@ cbjack_connect_ports (cubeb_stream * stream)
 
 skipplayback:
   if (*phys_out_ports == NULL) {
-    printf("NO CAPTURE PORTS\n");
     goto end;
   }
   // Connect inputs to capture
@@ -562,8 +562,13 @@ static void
 cbjack_destroy(cubeb * context)
 {
   context->active = false;
+
   if (context->jack_client != NULL)
     api_jack_client_close (context->jack_client);
+
+  if (context->libjack)
+    dlclose(context->libjack);
+
   free(context);
 }
 
@@ -593,7 +598,6 @@ cbjack_stream_init(cubeb * context, cubeb_stream ** stream, char const * stream_
                    void * user_ptr)
 {
   int stream_actual_rate = 0;
-
   if (output_stream_params
      && (output_stream_params->format != CUBEB_SAMPLE_FLOAT32NE &&
          output_stream_params->format != CUBEB_SAMPLE_S16NE)
@@ -787,30 +791,94 @@ cbjack_stream_set_volume(cubeb_stream * stm, float volume)
   return CUBEB_OK;
 }
 
+
+static int
+cbjack_stream_get_current_device(cubeb_stream * stm, cubeb_device ** const device)
+{
+  *device = (cubeb_device *)calloc(1, sizeof(cubeb_device));
+  if (*device == NULL)
+    return CUBEB_ERROR;
+
+  const char *j_in = "jack input";
+  const char *j_out = "jack_output";
+  const char *empty = "";
+
+  if (stm->devs == DUPLEX) {
+    (*device)->input_name = strdup(j_in);
+    (*device)->output_name = strdup(j_out);
+  } else if (stm->devs == IN_ONLY) {
+    (*device)->input_name = strdup(j_in);
+    (*device)->output_name = strdup(empty);
+  } else if (stm->devs == OUT_ONLY) {
+    (*device)->input_name = strdup(empty);
+    (*device)->output_name = strdup(j_out);
+  }
+
+  return CUBEB_OK;
+}
+
+static int
+cbjack_stream_device_destroy(cubeb_stream * stream,
+                             cubeb_device * device)
+{
+  free(device->input_name);
+  free(device->output_name);
+  free(device);
+  return CUBEB_OK;
+}
+
 static int
 cbjack_enumerate_devices(cubeb * context, cubeb_device_type type,
                          cubeb_device_collection ** collection)
 {
-  context->devinfo[0].type = CUBEB_DEVICE_TYPE_OUTPUT;
-  context->devinfo[0].state = CUBEB_DEVICE_STATE_ENABLED;
-  context->devinfo[0].preferred = CUBEB_DEVICE_PREF_NONE;
-  context->devinfo[0].max_channels = MAX_CHANNELS;
-  context->devinfo[0].default_format = CUBEB_DEVICE_FMT_F32NE;
+  uint32_t rate;
+  cbjack_get_preferred_sample_rate(context, &rate);
+  const char *j_in = "jack input";
+  const char *j_out = "jack output";
 
-  context->devinfo[1].type = CUBEB_DEVICE_TYPE_INPUT;
-  context->devinfo[1].state = CUBEB_DEVICE_STATE_ENABLED;
-  context->devinfo[1].preferred = CUBEB_DEVICE_PREF_NONE;
-  context->devinfo[1].max_channels = MAX_CHANNELS;
-  context->devinfo[1].default_format = CUBEB_DEVICE_FMT_F32NE;
-
+  context->devinfo = (cubeb_device_info *)malloc(sizeof(cubeb_device_info));
+  if (type & CUBEB_DEVICE_TYPE_OUTPUT) {
+    context->devinfo->device_id = strdup(j_out);
+    context->devinfo->devid = context->devinfo->device_id;
+    context->devinfo->friendly_name = strdup(j_out);
+    context->devinfo->group_id = strdup(j_out);
+    context->devinfo->vendor_name = strdup(j_out);
+    context->devinfo->type = CUBEB_DEVICE_TYPE_OUTPUT;
+    context->devinfo->state = CUBEB_DEVICE_STATE_ENABLED;
+    context->devinfo->preferred = CUBEB_DEVICE_PREF_ALL;
+    context->devinfo->format = CUBEB_DEVICE_FMT_F32NE;
+    context->devinfo->default_format = CUBEB_DEVICE_FMT_F32NE;
+    context->devinfo->max_channels = MAX_CHANNELS;
+    context->devinfo->min_rate = rate;
+    context->devinfo->max_rate = rate;
+    context->devinfo->default_rate = rate;
+    context->devinfo->latency_lo_ms = 0;
+    context->devinfo->latency_hi_ms = 10;
+  } else if (type & CUBEB_DEVICE_TYPE_INPUT) {
+    context->devinfo->device_id = strdup(j_in);
+    context->devinfo->devid = context->devinfo->device_id;
+    context->devinfo->friendly_name = strdup(j_in);
+    context->devinfo->group_id = strdup(j_in);
+    context->devinfo->vendor_name = strdup(j_in);
+    context->devinfo->type = CUBEB_DEVICE_TYPE_INPUT;
+    context->devinfo->state = CUBEB_DEVICE_STATE_ENABLED;
+    context->devinfo->preferred = CUBEB_DEVICE_PREF_ALL;
+    context->devinfo->format = CUBEB_DEVICE_FMT_F32NE;
+    context->devinfo->default_format = CUBEB_DEVICE_FMT_F32NE;
+    context->devinfo->max_channels = MAX_CHANNELS;
+    context->devinfo->min_rate = rate;
+    context->devinfo->max_rate = rate;
+    context->devinfo->default_rate = rate;
+    context->devinfo->latency_lo_ms = 0;
+    context->devinfo->latency_hi_ms = 10;
+  }
   *collection = (cubeb_device_collection *)
                  malloc(sizeof(cubeb_device_collection) +
-                        2 * sizeof(cubeb_device_info *));
+                        sizeof(cubeb_device_info *));
 
-  (*collection)->count = 2;
+  (*collection)->count = 1;
 
-  (*collection)->device[0] = &context->devinfo[0];
-  (*collection)->device[1] = &context->devinfo[1];
+  (*collection)->device[0] = context->devinfo;
 
   return CUBEB_OK;
 }
