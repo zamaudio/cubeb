@@ -52,7 +52,6 @@ JACK_API_VISIT(IMPORT_FUNC);
 static const int MAX_STREAMS = 16;
 static const int MAX_CHANNELS  = 8;
 static const int FIFO_SIZE = 4096 * sizeof(float);
-static const bool AUTO_CONNECT_JACK_PORTS = true;
 
 enum devstream {
   NONE = 0,
@@ -68,6 +67,16 @@ s16ne_to_float(float *dst, const int16_t *src, size_t n)
     *(dst++) = (float)((float)*(src++) / 32767.0f);
 }
 
+static void
+float_to_s16ne(int16_t *dst, float *src, size_t n)
+{
+  for (size_t i = 0; i < n; i++) {
+    if (*src > 1.f) *src = 1.f;
+    if (*src < -1.f) *src = -1.f;
+    *(dst++) = (int16_t)((int16_t)(*(src++) * 32767));
+  }
+}
+
 extern "C"
 {
 /*static*/ int jack_init (cubeb ** context, char const * context_name);
@@ -78,7 +87,9 @@ static int cbjack_get_min_latency(cubeb * ctx, cubeb_stream_params params, uint3
 static int cbjack_get_latency(cubeb_stream * stm, unsigned int * latency_ms);
 static int cbjack_get_preferred_sample_rate(cubeb * ctx, uint32_t * rate);
 static void cbjack_destroy(cubeb * context);
-static void cbjack_deinterleave_audio(cubeb_stream * stream, float **bufs_in, float **bufs_out, jack_nframes_t nframes);
+static void cbjack_interleave_capture(cubeb_stream * stream, float **in, jack_nframes_t nframes, bool format_mismatch);
+static void cbjack_deinterleave_playback_refill_s16ne(cubeb_stream * stream, short **bufs_in, float **bufs_out, jack_nframes_t nframes);
+static void cbjack_deinterleave_playback_refill_float(cubeb_stream * stream, float **bufs_in, float **bufs_out, jack_nframes_t nframes);
 static int cbjack_stream_device_destroy(cubeb_stream * stream,
                                         cubeb_device * device);
 static int cbjack_stream_get_current_device(cubeb_stream * stm, cubeb_device ** const device);
@@ -226,7 +237,7 @@ cbjack_connect_ports (cubeb_stream * stream)
   }
 
   // Connect outputs to playback
-  for (unsigned int c = 0; c < stream->out_params.channels && stream->output_ports[c]; c++) {
+  for (unsigned int c = 0; c < stream->out_params.channels && (stream->output_ports[c] != NULL); c++) {
     const char *src_port = api_jack_port_name (stream->output_ports[c]);
 
     api_jack_connect (stream->context->jack_client, src_port, phys_in_ports[c]);
@@ -237,7 +248,7 @@ skipplayback:
     goto end;
   }
   // Connect inputs to capture
-  for (unsigned int c = 0; c < stream->in_params.channels && stream->input_ports[c]; c++) {
+  for (unsigned int c = 0; c < stream->in_params.channels && (stream->input_ports[c] != NULL); c++) {
     const char *src_port = api_jack_port_name (stream->input_ports[c]);
 
     api_jack_connect (stream->context->jack_client, phys_out_ports[c], src_port);
@@ -336,132 +347,167 @@ cbjack_process(jack_nframes_t nframes, void *arg)
         }
       }
     } else {
+
+      int16_t *in_s16ne = stm->context->in_resampled_interleaved_buffer_s16ne;
+      float *in_float = stm->context->in_resampled_interleaved_buffer_float;
+
       // unpaused, play audio
-      cbjack_deinterleave_audio(stm, bufs_in, bufs_out, nframes);
+      if (stm->devs == DUPLEX) {
+        if (stm->out_params.format == CUBEB_SAMPLE_S16NE) {
+          cbjack_interleave_capture(stm, bufs_in, nframes, true);
+          cbjack_deinterleave_playback_refill_s16ne(stm, &in_s16ne, bufs_out, nframes);
+        } else if (stm->out_params.format == CUBEB_SAMPLE_FLOAT32NE) {
+          cbjack_interleave_capture(stm, bufs_in, nframes, false);
+          cbjack_deinterleave_playback_refill_float(stm, &in_float, bufs_out, nframes);
+        }
+      } else if (stm->devs == IN_ONLY) {
+        if (stm->in_params.format == CUBEB_SAMPLE_S16NE) {
+          cbjack_interleave_capture(stm, bufs_in, nframes, true);
+          cbjack_deinterleave_playback_refill_s16ne(stm, &in_s16ne, nullptr, nframes);
+        } else if (stm->in_params.format == CUBEB_SAMPLE_FLOAT32NE) {
+          cbjack_interleave_capture(stm, bufs_in, nframes, false);
+          cbjack_deinterleave_playback_refill_float(stm, &in_float, nullptr, nframes);
+        }
+      } else if (stm->devs == OUT_ONLY) {
+        if (stm->out_params.format == CUBEB_SAMPLE_S16NE) {
+          cbjack_deinterleave_playback_refill_s16ne(stm, nullptr, bufs_out, nframes);
+        } else if (stm->out_params.format == CUBEB_SAMPLE_FLOAT32NE) {
+          cbjack_deinterleave_playback_refill_float(stm, nullptr, bufs_out, nframes);
+        }
+      }
     }
   }
 
   return 0;
 }
 
+
 static void
-cbjack_deinterleave_audio(cubeb_stream * stream, float **bufs_in, float **bufs_out, jack_nframes_t nframes)
+cbjack_deinterleave_playback_refill_float(cubeb_stream * stream, float **in, float **bufs_out, jack_nframes_t nframes)
 {
   float *in_interleaved_buffer = nullptr;
   float *out_interleaved_buffer = nullptr;
 
-  long resampler_needed_frames = nframes;
-  long resampler_done_frames = 0;
+  float *inptr = (in != NULL) ? *in : nullptr;
+  float *outptr = (bufs_out != NULL) ? *bufs_out : nullptr;
+
+  long needed_frames = nframes;
+  long done_frames = 0;
   long input_frames_count = nframes;
 
- if (stream->devs == DUPLEX) {
-  if (stream->out_params.format == CUBEB_SAMPLE_S16NE) {
-    resampler_done_frames = cubeb_resampler_fill(stream->resampler,
-                                                   stream->context->in_resampled_interleaved_buffer_s16ne,
-                                                   &input_frames_count,
-                                                   stream->context->out_resampled_interleaved_buffer_s16ne,
-                                                   resampler_needed_frames);
 
-    s16ne_to_float(stream->context->out_resampled_interleaved_buffer_float, stream->context->out_resampled_interleaved_buffer_s16ne, resampler_done_frames * stream->out_params.channels);
-    s16ne_to_float(stream->context->in_resampled_interleaved_buffer_float, stream->context->in_resampled_interleaved_buffer_s16ne, input_frames_count * stream->in_params.channels);
+  done_frames = cubeb_resampler_fill(stream->resampler,
+                                     inptr,
+                                     (in != NULL) ? &input_frames_count : NULL,
+                                     stream->context->out_resampled_interleaved_buffer_float,
+                                     needed_frames);
 
-  } else if (stream->out_params.format == CUBEB_SAMPLE_FLOAT32NE) {
-    resampler_done_frames = cubeb_resampler_fill(stream->resampler,
-                                                   stream->context->in_resampled_interleaved_buffer_float,
-                                                   &input_frames_count,
-                                                   stream->context->out_resampled_interleaved_buffer_float,
-                                                   resampler_needed_frames);
-  }
   out_interleaved_buffer = stream->context->out_resampled_interleaved_buffer_float;
-  in_interleaved_buffer = stream->context->in_resampled_interleaved_buffer_float;
- } else if (stream->devs == OUT_ONLY) {
-  if (stream->out_params.format == CUBEB_SAMPLE_S16NE) {
-    resampler_done_frames = cubeb_resampler_fill(stream->resampler,
-                                                   NULL,
-                                                   0,
-                                                   stream->context->out_resampled_interleaved_buffer_s16ne,
-                                                   resampler_needed_frames);
 
-    s16ne_to_float(stream->context->out_resampled_interleaved_buffer_float, stream->context->out_resampled_interleaved_buffer_s16ne, resampler_done_frames * stream->out_params.channels);
-  } else if (stream->out_params.format == CUBEB_SAMPLE_FLOAT32NE) {
-    resampler_done_frames = cubeb_resampler_fill(stream->resampler,
-                                                   NULL,
-                                                   0,
-                                                   stream->context->out_resampled_interleaved_buffer_float,
-                                                   resampler_needed_frames);
-  }
-  out_interleaved_buffer = stream->context->out_resampled_interleaved_buffer_float;
- } else {
-  resampler_needed_frames = 0;
-  if (stream->in_params.format == CUBEB_SAMPLE_S16NE) {
-    resampler_done_frames = cubeb_resampler_fill(stream->resampler,
-                                                   stream->context->in_resampled_interleaved_buffer_s16ne,
-                                                   &input_frames_count,
-                                                   NULL,
-                                                   resampler_needed_frames);
-
-    s16ne_to_float(stream->context->in_resampled_interleaved_buffer_float, stream->context->in_resampled_interleaved_buffer_s16ne, input_frames_count * stream->in_params.channels);
-
-  } else if (stream->in_params.format == CUBEB_SAMPLE_FLOAT32NE) {
-    resampler_done_frames = cubeb_resampler_fill(stream->resampler,
-                                                   stream->context->in_resampled_interleaved_buffer_float,
-                                                   &input_frames_count,
-                                                   NULL,
-                                                   resampler_needed_frames);
-  }
-  in_interleaved_buffer = stream->context->in_resampled_interleaved_buffer_float;
- }
-
- if (stream->devs == OUT_ONLY || stream->devs == DUPLEX) {
-  // convert interleaved output buffers to contiguous buffers
-  for (unsigned int c = 0; c < stream->out_params.channels; c++) {
-    float* buffer = bufs_out[c];
-    for (long f = 0; f < resampler_done_frames; f++) {
-      buffer[f] = out_interleaved_buffer[(f * stream->out_params.channels) + c] * stream->volume;
-    }
-    if (resampler_done_frames < resampler_needed_frames) {
-      // draining
-      for (long f = resampler_done_frames; f < resampler_needed_frames; f++) {
-        buffer[f] = 0.f;
+  if (outptr) {
+    // convert interleaved output buffers to contiguous buffers
+    for (unsigned int c = 0; c < stream->out_params.channels; c++) {
+      float* buffer = bufs_out[c];
+      for (long f = 0; f < done_frames; f++) {
+        buffer[f] = out_interleaved_buffer[(f * stream->out_params.channels) + c] * stream->volume;
       }
-    }
-    if (resampler_done_frames == 0) {
-      // stop, but first zero out the existing buffer
-      for (long f = 0; f < resampler_needed_frames; f++) {
-        buffer[f] = 0.f;
+      if (done_frames < needed_frames) {
+        // draining
+        for (long f = done_frames; f < needed_frames; f++) {
+          buffer[f] = 0.f;
+        }
+      }
+      if (done_frames == 0) {
+        // stop, but first zero out the existing buffer
+        for (long f = 0; f < needed_frames; f++) {
+          buffer[f] = 0.f;
+        }
       }
     }
   }
- }
- if (stream->devs == IN_ONLY || stream->devs == DUPLEX) {
-  // convert interleaved input buffers to contiguous buffers
-  for (unsigned int c = 0; c < stream->in_params.channels; c++) {
-    float* buffer = bufs_in[c];
-    for (long f = 0; f < resampler_done_frames; f++) {
-      buffer[f] = in_interleaved_buffer[(f * stream->in_params.channels) + c] * stream->volume;
-    }
-    if (resampler_done_frames < input_frames_count) {
-      // draining
-      for (long f = resampler_done_frames; f < input_frames_count; f++) {
-        buffer[f] = 0.f;
-      }
-    }
-    if (resampler_done_frames == 0) {
-      // stop, but first zero out the existing buffer
-      for (long f = 0; f < input_frames_count; f++) {
-        buffer[f] = 0.f;
-      }
-    }
-  }
- }
-  if (resampler_done_frames == 0) {
+
+  if (done_frames == 0) {
     // stop stream
     cbjack_stream_stop(stream);
     // set drained state
     stream->state_callback(stream, stream->user_ptr, CUBEB_STATE_DRAINED);
   } else {
     // advance stream position
-    stream->position += resampler_done_frames * stream->ratio;
+    stream->position += done_frames * stream->ratio;
+  }
+}
+
+static void
+cbjack_deinterleave_playback_refill_s16ne(cubeb_stream * stream, short **in, float **bufs_out, jack_nframes_t nframes)
+{
+  float *in_interleaved_buffer = nullptr;
+  float *out_interleaved_buffer = nullptr;
+
+  short *inptr = (in != NULL) ? *in : nullptr;
+  float *outptr = (bufs_out != NULL) ? *bufs_out : nullptr;
+
+  long needed_frames = nframes;
+  long done_frames = 0;
+  long input_frames_count = nframes;
+
+  done_frames = cubeb_resampler_fill(stream->resampler,
+                                     inptr,
+                                     (in != NULL) ? &input_frames_count : NULL,
+                                     stream->context->out_resampled_interleaved_buffer_s16ne,
+                                     needed_frames);
+
+  s16ne_to_float(stream->context->out_resampled_interleaved_buffer_float, stream->context->out_resampled_interleaved_buffer_s16ne, done_frames * stream->out_params.channels);
+
+  out_interleaved_buffer = stream->context->out_resampled_interleaved_buffer_float;
+
+  if (outptr) {
+    // convert interleaved output buffers to contiguous buffers
+    for (unsigned int c = 0; c < stream->out_params.channels; c++) {
+      float* buffer = bufs_out[c];
+      for (long f = 0; f < done_frames; f++) {
+        buffer[f] = out_interleaved_buffer[(f * stream->out_params.channels) + c] * stream->volume;
+      }
+      if (done_frames < needed_frames) {
+        // draining
+        for (long f = done_frames; f < needed_frames; f++) {
+          buffer[f] = 0.f;
+        }
+      }
+      if (done_frames == 0) {
+        // stop, but first zero out the existing buffer
+        for (long f = 0; f < needed_frames; f++) {
+          buffer[f] = 0.f;
+        }
+      }
+    }
+  }
+
+  if (done_frames == 0) {
+    // stop stream
+    cbjack_stream_stop(stream);
+    // set drained state
+    stream->state_callback(stream, stream->user_ptr, CUBEB_STATE_DRAINED);
+  } else {
+    // advance stream position
+    stream->position += done_frames * stream->ratio;
+  }
+}
+
+static void
+cbjack_interleave_capture(cubeb_stream * stream, float **in, jack_nframes_t nframes, bool format_mismatch)
+{
+  float *in_buffer = stream->context->in_float_interleaved_buffer;
+
+  for (unsigned int c = 0; c < stream->in_params.channels; c++) {
+    for (long f = 0; f < nframes; f++) {
+      in_buffer[(f * stream->in_params.channels) + c] = in[c][f] * stream->volume;
+    }
+  }
+  if (format_mismatch) {
+    float_to_s16ne(stream->context->in_resampled_interleaved_buffer_s16ne, in_buffer, nframes * stream->in_params.channels);
+  } else {
+    memset(stream->context->in_resampled_interleaved_buffer_float, 0, sizeof(stream->context->in_resampled_interleaved_buffer_float));
+    memcpy(stream->context->in_resampled_interleaved_buffer_float, in_buffer, sizeof(in_buffer));
   }
 }
 
