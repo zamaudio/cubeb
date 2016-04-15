@@ -237,7 +237,7 @@ cbjack_connect_ports (cubeb_stream * stream)
   }
 
   // Connect outputs to playback
-  for (unsigned int c = 0; c < stream->out_params.channels && (stream->output_ports[c] != NULL); c++) {
+  for (unsigned int c = 0; c < stream->out_params.channels && phys_in_ports[c] != NULL; c++) {
     const char *src_port = api_jack_port_name (stream->output_ports[c]);
 
     api_jack_connect (stream->context->jack_client, src_port, phys_in_ports[c]);
@@ -248,7 +248,7 @@ skipplayback:
     goto end;
   }
   // Connect inputs to capture
-  for (unsigned int c = 0; c < stream->in_params.channels && (stream->input_ports[c] != NULL); c++) {
+  for (unsigned int c = 0; c < stream->in_params.channels && phys_out_ports[c] != NULL; c++) {
     const char *src_port = api_jack_port_name (stream->input_ports[c]);
 
     api_jack_connect (stream->context->jack_client, phys_out_ports[c], src_port);
