@@ -385,7 +385,6 @@ cbjack_process(jack_nframes_t nframes, void *arg)
 static void
 cbjack_deinterleave_playback_refill_float(cubeb_stream * stream, float **in, float **bufs_out, jack_nframes_t nframes)
 {
-  float *in_interleaved_buffer = nullptr;
   float *out_interleaved_buffer = nullptr;
 
   float *inptr = (in != NULL) ? *in : nullptr;
@@ -440,7 +439,6 @@ cbjack_deinterleave_playback_refill_float(cubeb_stream * stream, float **in, flo
 static void
 cbjack_deinterleave_playback_refill_s16ne(cubeb_stream * stream, short **in, float **bufs_out, jack_nframes_t nframes)
 {
-  float *in_interleaved_buffer = nullptr;
   float *out_interleaved_buffer = nullptr;
 
   short *inptr = (in != NULL) ? *in : nullptr;
@@ -506,8 +504,8 @@ cbjack_interleave_capture(cubeb_stream * stream, float **in, jack_nframes_t nfra
   if (format_mismatch) {
     float_to_s16ne(stream->context->in_resampled_interleaved_buffer_s16ne, in_buffer, nframes * stream->in_params.channels);
   } else {
-    memset(stream->context->in_resampled_interleaved_buffer_float, 0, sizeof(stream->context->in_resampled_interleaved_buffer_float));
-    memcpy(stream->context->in_resampled_interleaved_buffer_float, in_buffer, sizeof(in_buffer));
+    memset(stream->context->in_resampled_interleaved_buffer_float, 0, (FIFO_SIZE * MAX_CHANNELS * 3) * sizeof(float));
+    memcpy(stream->context->in_resampled_interleaved_buffer_float, in_buffer, (FIFO_SIZE * MAX_CHANNELS * 2) * sizeof(float));
   }
 }
 
